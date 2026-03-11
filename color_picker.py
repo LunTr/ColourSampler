@@ -1,269 +1,515 @@
 # -*- coding: utf-8 -*-
 """
 屏幕取色器 - 实时获取鼠标位置的颜色
-需要安装: pip install pillow pyautogui
+需要安装: pip install pillow pyautogui PyQt6
 """
 
-import tkinter as tk
+from dataclasses import dataclass
+import logging
+import sys
+import time
+from typing import Optional
+
 import pyautogui
 from PIL import ImageGrab
-import threading
-import time
+from PyQt6.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QCursor, QFont, QKeySequence, QPalette, QShortcut, QCloseEvent
+from PyQt6.QtWidgets import QApplication, QGraphicsDropShadowEffect, QLabel, QPushButton, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout
 
 
-class ColorPicker:
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("屏幕取色器")
-        self.root.geometry("560x300")
-        self.root.resizable(False, False)
-        self.root.attributes('-topmost', True)  # 窗口置顶
+logger = logging.getLogger(__name__)
 
-        self.running = True
-        self.locked = False  # 锁定状态
-        self.current_color = "#FFFFFF"
-        self.current_hex = "#FFFFFF"
-        self.current_rgb = "255, 255, 255"
-        self.current_text_color = "#000000"
-        self.current_shadow_color = "#ffffff"
+WINDOW_WIDTH = 320
+WINDOW_HEIGHT = 200
+REFRESH_INTERVAL = 0.05
+DEFAULT_HEX = "#FFFFFF"
+DEFAULT_RGB_TEXT = "255, 255, 255"
+DEFAULT_POSITION_TEXT = "(0, 0)"
+DEFAULT_TEXT_COLOR = "#000000"
+DEFAULT_SHADOW_COLOR = "#ffffff"
+LIVE_TIP_TEXT = "移动鼠标实时取色 | 空格键锁定"
+LOCKED_TIP_TEXT = "已锁定 | 空格键解锁"
+WINDOW_PAUSE_TIP_TEXT = "已暂停取色（鼠标在窗口内）"
+COPY_FAILED_TEXT = "复制失败"
+LOCKED_TIP_COLOR = "#ff6666"
+BUTTON_TEXT_COLOR = "#333333"
+BUTTON_BG_COLOR = "#f0f0f0"
+BUTTON_BORDER_COLOR = "#ffffff"
 
-        self.setup_ui()
-        self.bind_keys()
-        self.start_color_thread()
 
-    def setup_ui(self):
-        # 主画布，用于绘制带阴影的文字
-        self.canvas = tk.Canvas(self.root, width=560, height=300,
-                                 bg="#FFFFFF", highlightthickness=0)
-        self.canvas.place(x=0, y=0)
+@dataclass(frozen=True)
+class ColorSample:
+    x: int
+    y: int
+    r: int
+    g: int
+    b: int
+    hex_color: str
+    rgb_text: str
+    pos_text: str
+    text_color: str
+    shadow_color: str
 
-        # 创建带阴影的文字（阴影在下，白字在上）
-        # HEX标签
-        self.hex_shadow = self.canvas.create_text(50, 55, text="HEX:",
-                                                   font=("Consolas", 14), fill="#333333", anchor="w")
-        self.hex_text = self.canvas.create_text(48, 53, text="HEX:",
-                                                 font=("Consolas", 14), fill="white", anchor="w")
 
-        # HEX值（大字）
-        self.hex_val_shadow = self.canvas.create_text(130, 55, text="#FFFFFF",
-                                                       font=("Consolas", 28, "bold"), fill="#333333", anchor="w")
-        self.hex_val_text = self.canvas.create_text(128, 53, text="#FFFFFF",
-                                                     font=("Consolas", 28, "bold"), fill="white", anchor="w")
+@dataclass
+class PickerState:
+    running: bool = True
+    locked: bool = False
+    paused_by_window: bool = False
+    current_hex: str = DEFAULT_HEX
+    current_rgb: str = DEFAULT_RGB_TEXT
+    current_text_color: str = DEFAULT_TEXT_COLOR
+    current_shadow_color: str = DEFAULT_SHADOW_COLOR
+    last_sample: Optional[ColorSample] = None
 
-        # RGB标签和值（字体调小）
-        self.rgb_shadow = self.canvas.create_text(50, 105, text="RGB:",
-                                                   font=("Consolas", 12), fill="#333333", anchor="w")
-        self.rgb_text = self.canvas.create_text(48, 103, text="RGB:",
-                                                 font=("Consolas", 12), fill="white", anchor="w")
 
-        self.rgb_val_shadow = self.canvas.create_text(120, 105, text="255, 255, 255",
-                                                       font=("Consolas", 14), fill="#333333", anchor="w")
-        self.rgb_val_text = self.canvas.create_text(118, 103, text="255, 255, 255",
-                                                     font=("Consolas", 14), fill="white", anchor="w")
+class ScreenColorSampler:
+    """负责采样鼠标位置与屏幕像素颜色，不依赖具体 UI。"""
 
-        # 位置标签和值（字体调小，改为坐标格式）
-        self.pos_shadow = self.canvas.create_text(50, 145, text="POS:",
-                                                   font=("Consolas", 12), fill="#333333", anchor="w")
-        self.pos_text = self.canvas.create_text(48, 143, text="POS:",
-                                                 font=("Consolas", 12), fill="white", anchor="w")
+    def get_mouse_position(self) -> Optional[tuple[int, int]]:
+        try:
+            point = pyautogui.position()
+            return point.x, point.y
+        except OSError as exc:
+            logger.warning("Failed to read mouse position: %s", exc)
+            return None
+        except Exception:
+            logger.exception("Unexpected error while reading mouse position")
+            return None
 
-        self.pos_val_shadow = self.canvas.create_text(120, 145, text="(0, 0)",
-                                                       font=("Consolas", 14), fill="#333333", anchor="w")
-        self.pos_val_text = self.canvas.create_text(118, 143, text="(0, 0)",
-                                                     font=("Consolas", 14), fill="white", anchor="w")
-
-        # 提示文字（移到左下角）
-        self.tip_shadow = self.canvas.create_text(52, 272, text="移动鼠标实时取色",
-                                                   font=("Microsoft YaHei", 10), fill="#333333", anchor="w")
-        self.tip_text = self.canvas.create_text(50, 270, text="移动鼠标实时取色",
-                                                 font=("Microsoft YaHei", 10), fill="white", anchor="w")
-
-        # 毛玻璃效果的圆角矩形按钮
-        # 复制HEX按钮
-        self.hex_btn_shadow = self.create_rounded_rect(52, 192, 172, 232, 12, fill="#aaaaaa", outline="")
-        self.hex_btn_bg = self.create_rounded_rect(50, 190, 170, 230, 12, fill="#f0f0f0", outline="#ffffff")
-        self.hex_btn_text = self.canvas.create_text(110, 210, text="复制 HEX",
-                                                     font=("Microsoft YaHei", 10), fill="#333333")
-        self.canvas.tag_bind(self.hex_btn_bg, "<Button-1>", lambda _: self.copy_hex())
-        self.canvas.tag_bind(self.hex_btn_text, "<Button-1>", lambda _: self.copy_hex())
-
-        # 复制RGB按钮
-        self.rgb_btn_shadow = self.create_rounded_rect(192, 192, 312, 232, 12, fill="#aaaaaa", outline="")
-        self.rgb_btn_bg = self.create_rounded_rect(190, 190, 310, 230, 12, fill="#f0f0f0", outline="#ffffff")
-        self.rgb_btn_text = self.canvas.create_text(250, 210, text="复制 RGB",
-                                                     font=("Microsoft YaHei", 10), fill="#333333")
-        self.canvas.tag_bind(self.rgb_btn_bg, "<Button-1>", lambda _: self.copy_rgb())
-        self.canvas.tag_bind(self.rgb_btn_text, "<Button-1>", lambda _: self.copy_rgb())
-
-        # 锁定状态开关（右上角，毛玻璃圆角矩形）
-        self.lock_shadow = self.create_rounded_rect(502, 22, 542, 62, 20, fill="#aaaaaa", outline="")
-        self.lock_bg = self.create_rounded_rect(500, 20, 540, 60, 20, fill="#4CAF50", outline="#ffffff")
-
-        # 锁定开关点击事件
-        self.canvas.tag_bind(self.lock_bg, "<Button-1>", self.toggle_lock)
-
-    def create_rounded_rect(self, x1, y1, x2, y2, radius, **kwargs):
-        """创建圆角矩形"""
-        points = [
-            x1 + radius, y1,
-            x2 - radius, y1,
-            x2, y1,
-            x2, y1 + radius,
-            x2, y2 - radius,
-            x2, y2,
-            x2 - radius, y2,
-            x1 + radius, y2,
-            x1, y2,
-            x1, y2 - radius,
-            x1, y1 + radius,
-            x1, y1,
-        ]
-        return self.canvas.create_polygon(points, smooth=True, **kwargs)
-
-    def bind_keys(self):
-        """绑定键盘事件"""
-        self.root.bind("<space>", self.toggle_lock)
-        self.root.focus_set()
-
-    def toggle_lock(self, _event=None):
-        """切换锁定状态"""
-        self.locked = not self.locked
-        if self.locked:
-            # 锁定状态 - 红色指示器
-            self.canvas.itemconfig(self.lock_bg, fill="#f44336")
-            self.canvas.itemconfig(self.tip_shadow, text="已锁定 | 空格键/点击解锁")
-            self.canvas.itemconfig(self.tip_text, text="已锁定 | 空格键/点击解锁", fill="#ff6666")
-        else:
-            # 取色状态 - 绿色指示器
-            self.canvas.itemconfig(self.lock_bg, fill="#4CAF50")
-            self.canvas.itemconfig(self.tip_shadow, text="移动鼠标实时取色", fill=self.current_shadow_color)
-            self.canvas.itemconfig(self.tip_text, text="移动鼠标实时取色", fill=self.current_text_color)
-
-    def get_pixel_color(self, x, y):
-        """获取指定位置的像素颜色"""
+    def get_pixel_color(self, x: int, y: int) -> Optional[tuple[int, int, int]]:
         try:
             screenshot = ImageGrab.grab(bbox=(x, y, x + 1, y + 1))
             pixel = screenshot.getpixel((0, 0))
-            return pixel[:3]  # 返回RGB
+            return tuple(pixel[:3])
+        except OSError as exc:
+            logger.warning("Failed to sample screen pixel at (%s, %s): %s", x, y, exc)
+            return None
         except Exception:
-            return (255, 255, 255)
+            logger.exception("Unexpected error while sampling screen pixel at (%s, %s)", x, y)
+            return None
 
-    def get_contrast_color(self, r, g, b, threshold=128):
-        """根据背景亮度返回对比色（黑或白）"""
-        brightness = (r * 299 + g * 587 + b * 114) / 1000
-        if brightness > threshold:
-            return "#000000", "#ffffff"  # 背景亮，用黑字白阴影
-        else:
-            return "#ffffff", "#333333"  # 背景暗，用白字深灰阴影
 
-    def update_color(self):
-        """更新颜色显示"""
-        while self.running:
-            try:
-                if not self.locked:  # 只在未锁定时更新
-                    x, y = pyautogui.position()
-                    r, g, b = self.get_pixel_color(x, y)
+def format_hex_color(r: int, g: int, b: int) -> str:
+    return f"#{r:02X}{g:02X}{b:02X}"
 
-                    hex_color = f"#{r:02X}{g:02X}{b:02X}"
-                    self.current_color = hex_color
 
-                    # 更新UI（线程安全）
-                    self.root.after(0, lambda: self.update_ui(hex_color, r, g, b, x, y))
+def format_rgb_text(r: int, g: int, b: int) -> str:
+    return f"{r}, {g}, {b}"
 
-            except Exception:
-                pass
 
-            time.sleep(0.05)  # 50ms刷新一次
+def format_position_text(x: int, y: int) -> str:
+    return f"({x}, {y})"
 
-    def update_ui(self, hex_color, r, g, b, x, y):
-        """更新界面显示"""
-        try:
-            # 更新背景色
-            self.canvas.config(bg=hex_color)
 
-            # 获取对比色
-            text_color, shadow_color = self.get_contrast_color(r, g, b)
+def get_contrast_colors(r: int, g: int, b: int, threshold: int = 128) -> tuple[str, str]:
+    brightness = (r * 299 + g * 587 + b * 114) / 1000
+    if brightness > threshold:
+        return "#000000", "#ffffff"
+    return "#ffffff", "#333333"
 
-            # 更新所有文字颜色
-            for text_item in [self.hex_text, self.hex_val_text, self.rgb_text,
-                              self.rgb_val_text, self.pos_text, self.pos_val_text]:
-                self.canvas.itemconfig(text_item, fill=text_color)
 
-            for shadow_item in [self.hex_shadow, self.hex_val_shadow, self.rgb_shadow,
-                                self.rgb_val_shadow, self.pos_shadow, self.pos_val_shadow]:
-                self.canvas.itemconfig(shadow_item, fill=shadow_color)
+def build_color_sample(x: int, y: int, rgb: tuple[int, int, int]) -> ColorSample:
+    r, g, b = rgb
+    text_color, shadow_color = get_contrast_colors(r, g, b)
+    return ColorSample(
+        x=x,
+        y=y,
+        r=r,
+        g=g,
+        b=b,
+        hex_color=format_hex_color(r, g, b),
+        rgb_text=format_rgb_text(r, g, b),
+        pos_text=format_position_text(x, y),
+        text_color=text_color,
+        shadow_color=shadow_color,
+    )
 
-            # 更新提示文字颜色（非锁定状态）
-            if not self.locked:
-                self.canvas.itemconfig(self.tip_text, fill=text_color)
-                self.canvas.itemconfig(self.tip_shadow, fill=shadow_color)
 
-            # 更新锁定指示器边框颜色
-            self.canvas.itemconfig(self.lock_bg, outline=text_color)
+def sample_current_color(sampler: ScreenColorSampler) -> Optional[ColorSample]:
+    position = sampler.get_mouse_position()
+    if position is None:
+        return None
 
-            # 更新HEX值
-            self.canvas.itemconfig(self.hex_val_shadow, text=hex_color)
-            self.canvas.itemconfig(self.hex_val_text, text=hex_color)
+    x, y = position
+    rgb = sampler.get_pixel_color(x, y)
+    if rgb is None:
+        return None
 
-            # 更新RGB值
-            rgb_str = f"{r}, {g}, {b}"
-            self.canvas.itemconfig(self.rgb_val_shadow, text=rgb_str)
-            self.canvas.itemconfig(self.rgb_val_text, text=rgb_str)
+    return build_color_sample(x, y, rgb)
 
-            # 更新位置（坐标格式）
-            pos_str = f"({x}, {y})"
-            self.canvas.itemconfig(self.pos_val_shadow, text=pos_str)
-            self.canvas.itemconfig(self.pos_val_text, text=pos_str)
 
-            # 保存当前值用于复制
-            self.current_hex = hex_color
-            self.current_rgb = rgb_str
-            self.current_text_color = text_color
-            self.current_shadow_color = shadow_color
-        except Exception:
-            pass
+class ColorSamplerWorker(QObject):
+    sample_ready = pyqtSignal(object)
+    finished = pyqtSignal()
 
-    def copy_hex(self):
-        """复制HEX值到剪贴板"""
-        self.root.clipboard_clear()
-        self.root.clipboard_append(self.current_hex)
-        self.canvas.itemconfig(self.tip_shadow, text="已复制HEX值!")
-        self.canvas.itemconfig(self.tip_text, text="已复制HEX值!")
-        self.root.after(1500, self.restore_tip)
+    def __init__(self, state: PickerState, sampler: ScreenColorSampler):
+        super().__init__()
+        self.state = state
+        self.sampler = sampler
+        self._running = True
 
-    def copy_rgb(self):
-        """复制RGB值到剪贴板"""
-        self.root.clipboard_clear()
-        self.root.clipboard_append(self.current_rgb)
-        self.canvas.itemconfig(self.tip_shadow, text="已复制RGB值!")
-        self.canvas.itemconfig(self.tip_text, text="已复制RGB值!")
-        self.root.after(1500, self.restore_tip)
-
-    def restore_tip(self):
-        """恢复提示标签"""
-        if self.locked:
-            self.canvas.itemconfig(self.tip_shadow, text="已锁定 | 空格键/点击解锁")
-            self.canvas.itemconfig(self.tip_text, text="已锁定 | 空格键/点击解锁", fill="#ff6666")
-        else:
-            self.canvas.itemconfig(self.tip_shadow, text="移动鼠标实时取色", fill=self.current_shadow_color)
-            self.canvas.itemconfig(self.tip_text, text="移动鼠标实时取色", fill=self.current_text_color)
-
-    def start_color_thread(self):
-        """启动颜色获取线程"""
-        self.color_thread = threading.Thread(target=self.update_color, daemon=True)
-        self.color_thread.start()
-
-    def on_closing(self):
-        """关闭窗口时的处理"""
-        self.running = False
-        self.root.destroy()
+    def stop(self):
+        self._running = False
 
     def run(self):
-        """运行程序"""
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-        self.root.mainloop()
+        try:
+            while self._running and self.state.running:
+                if self.state.locked or self.state.paused_by_window:
+                    time.sleep(REFRESH_INTERVAL)
+                    continue
+
+                try:
+                    sample = sample_current_color(self.sampler)
+                    if sample is not None:
+                        self.sample_ready.emit(sample)
+                except Exception:
+                    logger.exception("Unexpected error in color sampler worker")
+
+                time.sleep(REFRESH_INTERVAL)
+        finally:
+            self.finished.emit()
+
+
+class ColorPicker(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.state = PickerState()
+        self.sampler = ScreenColorSampler()
+        self.is_closing = False
+        self.worker_thread: Optional[QThread] = None
+        self.worker: Optional[ColorSamplerWorker] = None
+
+        self.tip_restore_timer = QTimer(self)
+        self.tip_restore_timer.setSingleShot(True)
+        self.tip_restore_timer.timeout.connect(self.restore_tip)
+
+        self.cursor_pause_timer = QTimer(self)
+        self.cursor_pause_timer.timeout.connect(self._update_pause_by_window)
+        self.cursor_pause_timer.start(int(REFRESH_INTERVAL * 1000))
+
+        self.space_shortcut = QShortcut(QKeySequence("Space"), self)
+        self.space_shortcut.activated.connect(self.toggle_lock)
+
+        self.setWindowTitle("屏幕取色器")
+        self.setFixedSize(WINDOW_WIDTH, WINDOW_HEIGHT)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAutoFillBackground(True)
+
+        self.setup_ui()
+        self._set_background_color(DEFAULT_HEX)
+        self.start_color_thread()
+
+    def setup_ui(self):
+        title_font = QFont("Consolas", 12, QFont.Weight.Bold)
+        large_value_font = QFont("Consolas", 32, QFont.Weight.Bold)
+        small_title_font = QFont("Consolas", 10, QFont.Weight.Bold)
+        value_font = QFont("Consolas", 12)
+        tip_font = QFont("Microsoft YaHei", 8)
+        button_font = QFont("Microsoft YaHei", 10, QFont.Weight.Bold)
+
+        self.label_shadow_effects: dict[QLabel, QGraphicsDropShadowEffect] = {}
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(15, 12, 15, 12)
+        main_layout.setSpacing(6)
+
+        # HEX Layout
+        hex_layout = QHBoxLayout()
+        self.hex_text = self._create_label("HEX:", title_font)
+        self.hex_val_text = self._create_label(DEFAULT_HEX, large_value_font)
+        hex_layout.addWidget(self.hex_text)
+        hex_layout.addSpacing(5)
+        hex_layout.addWidget(self.hex_val_text)
+        hex_layout.addStretch()
+        main_layout.addLayout(hex_layout)
+
+        # Middle Grid
+        grid_layout = QGridLayout()
+        grid_layout.setSpacing(5)
+        self.rgb_text = self._create_label("RGB:", small_title_font)
+        self.rgb_val_text = self._create_label(DEFAULT_RGB_TEXT, value_font)
+        self.pos_text = self._create_label("POS:", small_title_font)
+        self.pos_val_text = self._create_label(DEFAULT_POSITION_TEXT, value_font)
+
+        grid_layout.addWidget(self.rgb_text, 0, 0)
+        grid_layout.addWidget(self.rgb_val_text, 0, 1)
+        grid_layout.addWidget(self.pos_text, 1, 0)
+        grid_layout.addWidget(self.pos_val_text, 1, 1)
+        grid_layout.setColumnStretch(1, 1)
+        
+        # Center horizontally wrapper
+        mid_layout = QHBoxLayout()
+        mid_layout.addLayout(grid_layout)
+        mid_layout.addStretch()
+        main_layout.addLayout(mid_layout)
+
+        main_layout.addSpacing(5)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(10)
+        
+        self.hex_btn = QPushButton("复制 HEX", self)
+        self.hex_btn.setFont(button_font)
+        self.hex_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.hex_btn.clicked.connect(self.copy_hex)
+        self._apply_copy_button_style(self.hex_btn)
+        self._apply_widget_shadow(self.hex_btn, "#000000", 90, 15, 0, 3)
+
+        self.rgb_btn = QPushButton("复制 RGB", self)
+        self.rgb_btn.setFont(button_font)
+        self.rgb_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.rgb_btn.clicked.connect(self.copy_rgb)
+        self._apply_copy_button_style(self.rgb_btn)
+        self._apply_widget_shadow(self.rgb_btn, "#000000", 90, 15, 0, 3)
+
+        btn_layout.addWidget(self.hex_btn)
+        btn_layout.addWidget(self.rgb_btn)
+        btn_layout.addStretch()
+        main_layout.addLayout(btn_layout)
+
+        main_layout.addStretch()
+
+        self.tip_text = self._create_label(LIVE_TIP_TEXT, tip_font)
+        self.tip_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        main_layout.addWidget(self.tip_text)
+
+        self.content_labels = [
+            self.hex_text,
+            self.hex_val_text,
+            self.rgb_text,
+            self.rgb_val_text,
+            self.pos_text,
+            self.pos_val_text,
+        ]
+
+        self._apply_label_colors(self.content_labels, "white", "#333333")
+        self._set_tip(LIVE_TIP_TEXT, text_color="white", shadow_color="#333333")
+
+    def _create_label(self, text: str, font: QFont) -> QLabel:
+        label = QLabel(text, self)
+        label.setFont(font)
+        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        label.setStyleSheet("background-color: transparent;")
+        self.label_shadow_effects[label] = self._apply_widget_shadow(label, "#333333", 170, 10, 1, 2)
+        return label
+
+    def _with_alpha(self, color: str, alpha: int) -> QColor:
+        alpha = max(0, min(255, alpha))
+        rgba_color = QColor(color)
+        rgba_color.setAlpha(alpha)
+        return rgba_color
+
+    def _to_rgba_css(self, color: str, alpha: int) -> str:
+        rgba_color = self._with_alpha(color, alpha)
+        return f"rgba({rgba_color.red()}, {rgba_color.green()}, {rgba_color.blue()}, {rgba_color.alpha()})"
+
+    def _apply_widget_shadow(
+        self,
+        widget: QWidget,
+        color: str,
+        alpha: int,
+        blur_radius: float,
+        offset_x: int,
+        offset_y: int,
+    ) -> QGraphicsDropShadowEffect:
+        effect = QGraphicsDropShadowEffect(widget)
+        effect.setBlurRadius(blur_radius)
+        effect.setOffset(offset_x, offset_y)
+        effect.setColor(self._with_alpha(color, alpha))
+        widget.setGraphicsEffect(effect)
+        return effect
+
+    def _apply_copy_button_style(self, button: QPushButton):
+        button.setStyleSheet(
+            "QPushButton {"
+            f"background-color: {self._to_rgba_css(BUTTON_BG_COLOR, 190)};"
+            f"border: 1px solid {self._to_rgba_css(BUTTON_BORDER_COLOR, 220)};"
+            "border-radius: 8px;"
+            f"color: {BUTTON_TEXT_COLOR};"
+            "padding: 4px 12px;"
+            "}"
+            "QPushButton:hover {"
+            f"background-color: {self._to_rgba_css(BUTTON_BG_COLOR, 220)};"
+            "}"
+            "QPushButton:pressed {"
+            f"background-color: {self._to_rgba_css(BUTTON_BG_COLOR, 255)};"
+            "padding-top: 5px;"
+            "padding-left: 13px;"
+            "padding-bottom: 3px;"
+            "padding-right: 11px;"
+            "}"
+        )
+
+    def _set_background_color(self, color: str):
+        palette = self.palette()
+        palette.setColor(QPalette.ColorRole.Window, QColor(color))
+        self.setPalette(palette)
+
+    def _apply_label_colors(self, labels: list[QLabel], text_color: str, shadow_color: str):
+        for label in labels:
+            label.setStyleSheet(f"color: {text_color}; background-color: transparent;")
+            effect = self.label_shadow_effects.get(label)
+            if effect is not None:
+                effect.setColor(self._with_alpha(shadow_color, 170))
+
+    def _set_label_text(self, label: QLabel, value: str):
+        label.setText(value)
+
+    def toggle_lock(self):
+        self.state.locked = not self.state.locked
+        self.restore_tip()
+
+    def _set_tip(self, text: str, text_color: Optional[str] = None, shadow_color: Optional[str] = None):
+        if text_color is None:
+            text_color = self.state.current_text_color
+        if shadow_color is None:
+            shadow_color = self.state.current_shadow_color
+
+        self._set_label_text(self.tip_text, text)
+        self._apply_label_colors([self.tip_text], text_color, shadow_color)
+
+    def _show_live_tip(self):
+        self._set_tip(
+            LIVE_TIP_TEXT,
+            text_color=self.state.current_text_color,
+            shadow_color=self.state.current_shadow_color,
+        )
+
+    def _show_locked_tip(self):
+        self._set_tip(
+            LOCKED_TIP_TEXT,
+            text_color=LOCKED_TIP_COLOR,
+            shadow_color=self.state.current_shadow_color,
+        )
+
+    def _show_window_pause_tip(self):
+        self._set_tip(
+            WINDOW_PAUSE_TIP_TEXT,
+            text_color=self.state.current_text_color,
+            shadow_color=self.state.current_shadow_color,
+        )
+
+    def _show_copy_tip(self, message: str):
+        self._set_tip(
+            message,
+            text_color=self.state.current_text_color,
+            shadow_color=self.state.current_shadow_color,
+        )
+        self._schedule_tip_restore()
+
+    def _schedule_tip_restore(self):
+        self.tip_restore_timer.stop()
+        self.tip_restore_timer.start(1500)
+
+    def _is_cursor_inside_window(self) -> bool:
+        # Keep the check in Qt's coordinate space to avoid DPI scaling mismatches.
+        margin = 4
+        local_point = self.mapFromGlobal(QCursor.pos())
+        content_rect = self.rect().adjusted(margin, margin, -margin, -margin)
+        return content_rect.contains(local_point)
+
+    def _update_pause_by_window(self):
+        if self.is_closing or self.state.locked:
+            if self.state.paused_by_window:
+                self.state.paused_by_window = False
+            return
+
+        paused_by_window = self._is_cursor_inside_window()
+
+        if self.state.paused_by_window == paused_by_window:
+            return
+
+        self.state.paused_by_window = paused_by_window
+        if paused_by_window:
+            self._show_window_pause_tip()
+        else:
+            self._show_live_tip()
+
+    def start_color_thread(self):
+        self.worker_thread = QThread(self)
+        self.worker = ColorSamplerWorker(self.state, self.sampler)
+        self.worker.moveToThread(self.worker_thread)
+        self.worker.sample_ready.connect(self._apply_sample_to_ui)
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker_thread.start()
+
+    def _apply_sample_to_ui(self, sample: object):
+        if self.is_closing or not isinstance(sample, ColorSample):
+            return
+
+        self._set_background_color(sample.hex_color)
+        self._apply_label_colors(self.content_labels, sample.text_color, sample.shadow_color)
+
+        self._set_label_text(self.hex_val_text, sample.hex_color)
+        self._set_label_text(self.rgb_val_text, sample.rgb_text)
+        self._set_label_text(self.pos_val_text, sample.pos_text)
+
+        self.state.current_hex = sample.hex_color
+        self.state.current_rgb = sample.rgb_text
+        self.state.current_text_color = sample.text_color
+        self.state.current_shadow_color = sample.shadow_color
+        self.state.last_sample = sample
+
+        if self.state.locked:
+            self._show_locked_tip()
+        elif self.state.paused_by_window:
+            self._show_window_pause_tip()
+        else:
+            self._show_live_tip()
+
+    def _copy_to_clipboard(self, value: str, value_name: str):
+        try:
+            QApplication.clipboard().setText(value)
+        except Exception:
+            logger.exception("Failed to copy %s to clipboard", value_name)
+            self._show_copy_tip(COPY_FAILED_TEXT)
+            return
+
+        self._show_copy_tip(f"已复制{value_name}值!")
+
+    def copy_hex(self):
+        self._copy_to_clipboard(self.state.current_hex, "HEX")
+
+    def copy_rgb(self):
+        self._copy_to_clipboard(self.state.current_rgb, "RGB")
+
+    def restore_tip(self):
+        if self.state.locked:
+            self._show_locked_tip()
+        elif self.state.paused_by_window:
+            self._show_window_pause_tip()
+        else:
+            self._show_live_tip()
+
+    def closeEvent(self, event: QCloseEvent):
+        self.is_closing = True
+        self.state.running = False
+        self.tip_restore_timer.stop()
+        self.cursor_pause_timer.stop()
+
+        if self.worker is not None:
+            self.worker.stop()
+
+        if self.worker_thread is not None and self.worker_thread.isRunning():
+            self.worker_thread.quit()
+            if not self.worker_thread.wait(2000):
+                logger.warning("Color sampler thread did not stop before shutdown.")
+
+        event.accept()
+        super().closeEvent(event)
 
 
 if __name__ == "__main__":
-    app = ColorPicker()
-    app.run()
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+
+    app = QApplication(sys.argv)
+    window = ColorPicker()
+    window.show()
+    window.activateWindow()
+    window.setFocus()
+    sys.exit(app.exec())

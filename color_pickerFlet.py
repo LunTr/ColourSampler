@@ -6,9 +6,9 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import sys
-import tkinter as tk
 
 import flet as ft
+import flet_desktop  # noqa: F401
 import pyautogui
 from PIL import ImageGrab
 
@@ -28,7 +28,6 @@ class ColorPickerApp:
         self.current_b = 255
         self.pause_by_space = False
         self.pause_by_window = False
-        self.clipboard_helper: tk.Tk | None = None
 
         self.main_container: ft.Container | None = None
         self.hex_label_text: ft.Text | None = None
@@ -159,13 +158,7 @@ class ColorPickerApp:
 
     def copy_text_to_clipboard(self, text: str) -> bool:
         try:
-            if self.clipboard_helper is None:
-                self.clipboard_helper = tk.Tk()
-                self.clipboard_helper.withdraw()
-
-            self.clipboard_helper.clipboard_clear()
-            self.clipboard_helper.clipboard_append(text)
-            self.clipboard_helper.update()
+            self.page.set_clipboard(text)
             return True
         except Exception:
             return False
@@ -270,9 +263,6 @@ class ColorPickerApp:
         def on_window_event(e: ft.WindowEvent):
             if e.data == "close":
                 self.running = False
-                if self.clipboard_helper is not None:
-                    self.clipboard_helper.destroy()
-                    self.clipboard_helper = None
                 self.page.window.destroy()
 
         self.page.window.on_event = on_window_event
